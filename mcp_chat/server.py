@@ -8,8 +8,9 @@ from datetime import datetime
 
 from fastmcp import FastMCP
 
-from mcp_chat.models import User, Message
+from mcp_chat.history import HistoryManager
 from mcp_chat.managers import RoomManager
+from mcp_chat.models import Message, PersistedMessage, User
 
 # Set up logging
 logging.basicConfig(
@@ -22,6 +23,7 @@ mcp: Any = FastMCP(name="mcp-chat", version="0.1.0")
 
 # Initialize managers
 room_manager = RoomManager()
+history_manager = HistoryManager()
 
 # Store active connections (connection_id -> User)
 connections: Dict[str, User] = {}
@@ -114,12 +116,14 @@ async def join_room(room_id: str, display_name: str) -> Dict[str, Any]:
                 room_id in message_queues
                 and first_user.user_id in message_queues[room_id]
             ):
+                join_msg_id = str(uuid.uuid4())
+                join_timestamp = datetime.now().isoformat()
                 join_msg = {
                     "content": f"[System] {user.name} has joined the chat.",
                     "sender_name": "System",
                     "sender_id": "system",
-                    "timestamp": datetime.now().isoformat(),
-                    "message_id": str(uuid.uuid4()),
+                    "timestamp": join_timestamp,
+                    "message_id": join_msg_id,
                     "system": True,
                 }
                 try:
@@ -127,6 +131,18 @@ async def join_room(room_id: str, display_name: str) -> Dict[str, Any]:
                 except (asyncio.QueueFull, RuntimeError) as e:
                     # Queue might be full or closed
                     logger.debug(f"Could not send join notification: {e}")
+
+                # Persist system join message
+                persisted_join = PersistedMessage(
+                    message_id=join_msg_id,
+                    room_id=room_id,
+                    sender_id="system",
+                    sender_name="System",
+                    content=f"[System] {user.name} has joined the chat.",
+                    timestamp=join_timestamp,
+                    is_system=True,
+                )
+                await history_manager.add_message(room_id, persisted_join)
 
     # Update user-to-room mapping
     room_manager._user_to_room[user.user_id] = room_id
@@ -211,6 +227,18 @@ async def send_message(room_id: str, message: str, client_id: str) -> Dict[str, 
         "message_id": msg.message_id,
     }
 
+    # Persist the message
+    persisted_msg = PersistedMessage(
+        message_id=msg.message_id,
+        room_id=room_id,
+        sender_id=user.user_id,
+        sender_name=user.name,
+        content=message,
+        timestamp=msg.timestamp.isoformat(),
+        is_system=False,
+    )
+    await history_manager.add_message(room_id, persisted_msg)
+
     # Deliver to waiting recipients via message queues
     if room_id in message_queues:
         # Create a copy of items to avoid modification during iteration
@@ -293,6 +321,20 @@ async def leave_chat(room_id: str, client_id: str) -> Dict[str, Any]:
     # Log
     logger.info(f"User {user.name} left room {room_id}")
 
+    # Persist system leave message
+    leave_msg_id = str(uuid.uuid4())
+    leave_timestamp = datetime.now().isoformat()
+    persisted_leave = PersistedMessage(
+        message_id=leave_msg_id,
+        room_id=room_id,
+        sender_id="system",
+        sender_name="System",
+        content=f"[System] {user.name} has left the conversation.",
+        timestamp=leave_timestamp,
+        is_system=True,
+    )
+    await history_manager.add_message(room_id, persisted_leave)
+
     # Notify partner if they exist
     if partner:
         # Send disconnection message to waiting queue
@@ -301,8 +343,8 @@ async def leave_chat(room_id: str, client_id: str) -> Dict[str, Any]:
                 "content": "[System] Your chat partner has left the conversation.",
                 "sender_name": "System",
                 "sender_id": "system",
-                "timestamp": datetime.now().isoformat(),
-                "message_id": str(uuid.uuid4()),
+                "timestamp": leave_timestamp,
+                "message_id": leave_msg_id,
                 "system": True,
                 "disconnect": True,
             }
@@ -424,6 +466,112 @@ async def wait_for_message(
             if not message_queues[room_id]:
                 del message_queues[room_id]
             logger.info(f"Cleaned up message queue for {user.name}")
+
+
+@mcp.tool()
+async def get_history(room_id: str, limit: int | None = None) -> Dict[str, Any]:
+    """Retrieve message history for a room.
+
+    Returns all messages sent in the room, ordered chronologically.
+    Anyone with the room_id can retrieve the history (room_id acts as shared secret).
+
+    Args:
+        room_id: The ID of the room to get history for
+        limit: Optional maximum number of messages to return (most recent).
+               If not specified, returns all messages.
+
+    Returns:
+        {
+            "room_id": "...",
+            "messages": [
+                {
+                    "sender": "display_name",
+                    "content": "message text",
+                    "timestamp": "ISO timestamp",
+                    "message_id": "uuid",
+                    "is_system": false
+                }
+            ],
+            "total_count": 42
+        }
+    """
+    messages = await history_manager.get_history(room_id, limit)
+    total_count = await history_manager.get_message_count(room_id)
+
+    return {
+        "room_id": room_id,
+        "messages": [
+            {
+                "sender": m.sender_name,
+                "content": m.content,
+                "timestamp": m.timestamp,
+                "message_id": m.message_id,
+                "is_system": m.is_system,
+            }
+            for m in messages
+        ],
+        "total_count": total_count,
+    }
+
+
+@mcp.tool()
+async def get_room_status(room_id: str) -> Dict[str, Any]:
+    """Get status and metadata for a room.
+
+    Returns information about the room including active status, participants,
+    message count, and activity timestamps. Anyone with the room_id can
+    query status (room_id acts as shared secret).
+
+    Args:
+        room_id: The ID of the room to get status for
+
+    Returns:
+        {
+            "room_id": "...",
+            "exists": true,
+            "active": true,
+            "participants": ["Claude-1", "Claude-2"],
+            "message_count": 42,
+            "created_at": "ISO timestamp",
+            "last_activity": "ISO timestamp"
+        }
+    """
+    # Check in-memory room first (for active status)
+    room = await room_manager.get_room(room_id)
+
+    # Get persisted metadata
+    metadata = await history_manager.get_room_metadata(room_id)
+
+    if not room and not metadata:
+        return {
+            "room_id": room_id,
+            "exists": False,
+            "error": "Room not found",
+        }
+
+    # Merge live room data with persisted metadata
+    participants: list[str] = []
+    if room:
+        if room.user1:
+            participants.append(room.user1.name)
+        if room.user2 and room.user2.user_id != room.user1.user_id:
+            participants.append(room.user2.name)
+    elif metadata:
+        participants = metadata.participants
+
+    return {
+        "room_id": room_id,
+        "exists": True,
+        "active": room.active if room else False,
+        "participants": participants,
+        "message_count": metadata.message_count if metadata else 0,
+        "created_at": (
+            metadata.created_at
+            if metadata
+            else (room.created_at.isoformat() if room else None)
+        ),
+        "last_activity": metadata.last_activity if metadata else None,
+    }
 
 
 async def send_notification(

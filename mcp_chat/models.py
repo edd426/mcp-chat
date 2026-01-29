@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
 
@@ -53,3 +53,53 @@ class Message:
     sender_id: str = ""
     content: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class PersistedMessage:
+    """Message format for JSON persistence."""
+
+    message_id: str
+    room_id: str
+    sender_id: str
+    sender_name: str
+    content: str
+    timestamp: str  # ISO format string for JSON serialization
+    is_system: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "message_id": self.message_id,
+            "room_id": self.room_id,
+            "sender_id": self.sender_id,
+            "sender_name": self.sender_name,
+            "content": self.content,
+            "timestamp": self.timestamp,
+            "is_system": self.is_system,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PersistedMessage":
+        """Create from dictionary."""
+        return cls(
+            message_id=data["message_id"],
+            room_id=data["room_id"],
+            sender_id=data["sender_id"],
+            sender_name=data["sender_name"],
+            content=data["content"],
+            timestamp=data["timestamp"],
+            is_system=data.get("is_system", False),
+        )
+
+
+@dataclass
+class RoomMetadata:
+    """Room metadata for status queries."""
+
+    room_id: str
+    created_at: str  # ISO format
+    last_activity: str  # ISO format
+    message_count: int
+    participants: list[str]  # List of display names
+    active: bool
