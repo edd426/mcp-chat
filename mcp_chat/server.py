@@ -1,7 +1,6 @@
 """MCP Chat Server implementation."""
 
 from typing import Dict, Any
-import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -28,29 +27,21 @@ history_manager = HistoryManager()
 # Store active connections (connection_id -> User)
 connections: Dict[str, User] = {}
 
-# Message queues for long-polling (room_id -> {user_id -> Queue})
-message_queues: Dict[str, Dict[str, asyncio.Queue[Dict[str, Any]]]] = {}
-
 
 @mcp.tool()
 async def join_room(room_id: str, display_name: str) -> Dict[str, Any]:
-    """Join a specific chat room directly.
+    """Join a conversation thread.
 
-    Creates a new session with a unique client_id and adds the user to the specified room.
-    Useful for rejoining a room or creating private rooms.
-
-    IMPORTANT: After joining a room, prompt the user to choose whether they want to:
-    - Wait for messages (call wait_for_message) - if they expect to receive first
-    - Send a message (call send_message) - if they want to initiate conversation
-
-    This gives users control over the conversation flow rather than automatically blocking.
+    Creates a new session with a unique client_id and adds you to the specified room.
+    Messages persist even when you're not connected - you can leave and return later
+    to check for new messages using get_room_status and get_history.
 
     Args:
-        room_id: The ID of the room to join
-        display_name: Display name for the user (required)
+        room_id: The ID of the room to join (creates room if it doesn't exist)
+        display_name: Your display name in the conversation
 
     Returns:
-        Success status with client_id or error information
+        Success status with client_id, or error information
     """
     # Generate a unique client_id for this user
     connection_id = str(uuid.uuid4())
@@ -108,41 +99,20 @@ async def join_room(room_id: str, display_name: str) -> Dict[str, Any]:
     else:
         # Second user joining
         room.user2 = user
-        # Notify the first user
-        first_user = room.user1
-        if first_user and first_user.user_id in connections:
-            # Send notification about new user joining
-            if (
-                room_id in message_queues
-                and first_user.user_id in message_queues[room_id]
-            ):
-                join_msg_id = str(uuid.uuid4())
-                join_timestamp = datetime.now().isoformat()
-                join_msg = {
-                    "content": f"[System] {user.name} has joined the chat.",
-                    "sender_name": "System",
-                    "sender_id": "system",
-                    "timestamp": join_timestamp,
-                    "message_id": join_msg_id,
-                    "system": True,
-                }
-                try:
-                    message_queues[room_id][first_user.user_id].put_nowait(join_msg)
-                except (asyncio.QueueFull, RuntimeError) as e:
-                    # Queue might be full or closed
-                    logger.debug(f"Could not send join notification: {e}")
 
-                # Persist system join message
-                persisted_join = PersistedMessage(
-                    message_id=join_msg_id,
-                    room_id=room_id,
-                    sender_id="system",
-                    sender_name="System",
-                    content=f"[System] {user.name} has joined the chat.",
-                    timestamp=join_timestamp,
-                    is_system=True,
-                )
-                await history_manager.add_message(room_id, persisted_join)
+        # Persist system join message
+        join_msg_id = str(uuid.uuid4())
+        join_timestamp = datetime.now().isoformat()
+        persisted_join = PersistedMessage(
+            message_id=join_msg_id,
+            room_id=room_id,
+            sender_id="system",
+            sender_name="System",
+            content=f"[System] {user.name} has joined the chat.",
+            timestamp=join_timestamp,
+            is_system=True,
+        )
+        await history_manager.add_message(room_id, persisted_join)
 
     # Update user-to-room mapping
     room_manager._user_to_room[user.user_id] = room_id
@@ -164,23 +134,21 @@ async def join_room(room_id: str, display_name: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def send_message(room_id: str, message: str, client_id: str) -> Dict[str, Any]:
-    """Send a message to your chat partner.
+    """Post a message to a conversation thread.
 
-    IMPORTANT: After sending a message, you should immediately call wait_for_message
-    to receive the response. This enables real-time conversation flow.
+    The message is stored persistently and other participants will see it when they
+    check the room. Don't expect an immediate reply - this is asynchronous like email.
 
-    Typical usage:
-    1. Call send_message to send your message
-    2. Call wait_for_message to wait for the response
-    3. Repeat
+    To check for responses later, use get_room_status to see if message_count increased,
+    then get_history to retrieve new messages.
 
     Args:
         room_id: The ID of the chat room
         message: The message to send
-        client_id: Your client identifier (from enter_queue or join_room)
+        client_id: Your client identifier (from join_room)
 
     Returns:
-        Success status or error information
+        Success status with message_id and timestamp, or error information
     """
     # Use the provided client_id
     connection_id = client_id
@@ -218,15 +186,6 @@ async def send_message(room_id: str, message: str, client_id: str) -> Dict[str, 
     # Log message
     logger.info(f"Message from {user.name} to {partner.name}: {message[:50]}...")
 
-    # Create message data
-    message_data = {
-        "content": message,
-        "sender_name": user.name,
-        "sender_id": user.user_id,
-        "timestamp": msg.timestamp.isoformat(),
-        "message_id": msg.message_id,
-    }
-
     # Persist the message
     persisted_msg = PersistedMessage(
         message_id=msg.message_id,
@@ -239,33 +198,7 @@ async def send_message(room_id: str, message: str, client_id: str) -> Dict[str, 
     )
     await history_manager.add_message(room_id, persisted_msg)
 
-    # Deliver to waiting recipients via message queues
-    if room_id in message_queues:
-        # Create a copy of items to avoid modification during iteration
-        recipients = list(message_queues[room_id].items())
-        for recipient_id, queue in recipients:
-            if recipient_id != user.user_id:  # Don't send to self
-                try:
-                    # Put message in queue (non-blocking)
-                    queue.put_nowait(message_data)
-                    logger.info(
-                        f"Delivered message to waiting queue for {recipient_id}"
-                    )
-                except asyncio.QueueFull:
-                    logger.warning(f"Queue full for recipient {recipient_id}")
-                except Exception as e:
-                    # Handle case where queue was closed/cancelled
-                    logger.warning(f"Failed to deliver to {recipient_id}: {e}")
-                    # Clean up the dead queue
-                    if (
-                        room_id in message_queues
-                        and recipient_id in message_queues[room_id]
-                    ):
-                        del message_queues[room_id][recipient_id]
-                        if not message_queues[room_id]:
-                            del message_queues[room_id]
-
-    # Still send notification for future notification support
+    # Send notification for future notification support
     await send_notification(
         partner.connection_id,
         "message.received",
@@ -286,11 +219,14 @@ async def send_message(room_id: str, message: str, client_id: str) -> Dict[str, 
 
 @mcp.tool()
 async def leave_chat(room_id: str, client_id: str) -> Dict[str, Any]:
-    """Leave the current chat room.
+    """Leave a conversation thread.
+
+    Your messages remain in the room history. A system message noting your
+    departure will be recorded.
 
     Args:
         room_id: The ID of the chat room to leave
-        client_id: Your client identifier (from enter_queue)
+        client_id: Your client identifier (from join_room)
 
     Returns:
         Success status
@@ -337,24 +273,6 @@ async def leave_chat(room_id: str, client_id: str) -> Dict[str, Any]:
 
     # Notify partner if they exist
     if partner:
-        # Send disconnection message to waiting queue
-        if room_id in message_queues and partner.user_id in message_queues[room_id]:
-            disconnect_msg = {
-                "content": "[System] Your chat partner has left the conversation.",
-                "sender_name": "System",
-                "sender_id": "system",
-                "timestamp": leave_timestamp,
-                "message_id": leave_msg_id,
-                "system": True,
-                "disconnect": True,
-            }
-            try:
-                message_queues[room_id][partner.user_id].put_nowait(disconnect_msg)
-            except (asyncio.QueueFull, RuntimeError) as e:
-                # Queue might be full or closed
-                logger.debug(f"Could not send disconnect notification: {e}")
-
-        # Also send regular notification
         await send_notification(
             partner.connection_id,
             "partner.disconnected",
@@ -365,135 +283,23 @@ async def leave_chat(room_id: str, client_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def wait_for_message(
-    room_id: str, client_id: str, timeout: int = 60
-) -> Dict[str, Any]:
-    """Wait for a message in the chat room (long-polling).
-
-    This tool blocks until a message is received or the timeout is reached.
-    Use this after sending a message to wait for a response, or call it first
-    to wait for an incoming message.
-
-    Conversation flow:
-    - If you sent the last message: wait_for_message to get response
-    - If you're waiting for first contact: wait_for_message before sending
-    - After receiving a message: send_message to respond, then wait_for_message again
-
-    Args:
-        room_id: The ID of the chat room to listen in
-        client_id: Your client identifier (from enter_queue or join_room)
-        timeout: Timeout in seconds (default: 60, max: 300)
-
-    Returns:
-        On message: {"message": "text", "sender": "name", "timestamp": "...", "message_id": "..."}
-        On timeout: {"timeout": true, "message": "No message received"}
-        On error: {"error": "error message"}
-    """
-    # Use the provided client_id
-    connection_id = client_id
-
-    # Validate timeout
-    timeout = min(timeout, 300)  # Max 5 minutes
-    timeout = max(timeout, 1)  # Min 1 second
-
-    # Get user
-    user = connections.get(connection_id)
-    if not user:
-        logger.error(f"User not found for client_id: {client_id}")
-        logger.debug(f"Active connections: {list(connections.keys())}")
-        return {"error": f"User not found. Invalid client_id: {client_id}"}
-
-    # Get and validate room
-    room = await room_manager.get_room(room_id)
-    if not room:
-        return {"error": "Room not found"}
-
-    if not room.active:
-        return {"error": "Chat has ended"}
-
-    # Verify user is in the room
-    if not room.has_user(user.user_id):
-        return {"error": "You are not in this room"}
-
-    # Create a message queue for this user if not exists
-    if room_id not in message_queues:
-        message_queues[room_id] = {}
-
-    # Create queue with reasonable size limit
-    message_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=100)
-    message_queues[room_id][user.user_id] = message_queue
-
-    logger.info(
-        f"User {user.name} waiting for messages in room {room_id} (timeout: {timeout}s)"
-    )
-
-    try:
-        # Wait for a message with timeout
-        message_data = await asyncio.wait_for(
-            message_queue.get(), timeout=float(timeout)
-        )
-
-        logger.info(
-            f"Message received for {user.name}: {message_data.get('content', '')[:50]}..."
-        )
-
-        return {
-            "message": message_data["content"],
-            "sender": message_data["sender_name"],
-            "timestamp": message_data["timestamp"],
-            "message_id": message_data["message_id"],
-        }
-
-    except asyncio.TimeoutError:
-        logger.info(f"Timeout waiting for message for {user.name}")
-        return {"timeout": True, "message": "No message received within timeout period"}
-
-    except asyncio.CancelledError:
-        # Client cancelled the request - this is normal behavior
-        logger.info(f"Wait cancelled for {user.name}")
-        # Re-raise to let the framework handle it properly
-        raise
-
-    except Exception as e:
-        logger.error(f"Error in wait_for_message: {e}")
-        return {"error": f"Unexpected error: {str(e)}"}
-
-    finally:
-        # Clean up queue registration
-        if room_id in message_queues and user.user_id in message_queues[room_id]:
-            del message_queues[room_id][user.user_id]
-            # Clean up empty room entries
-            if not message_queues[room_id]:
-                del message_queues[room_id]
-            logger.info(f"Cleaned up message queue for {user.name}")
-
-
-@mcp.tool()
 async def get_history(room_id: str, limit: int | None = None) -> Dict[str, Any]:
-    """Retrieve message history for a room.
+    """Retrieve messages from a conversation thread.
 
-    Returns all messages sent in the room, ordered chronologically.
-    Anyone with the room_id can retrieve the history (room_id acts as shared secret).
+    Returns messages in chronological order. Use the limit parameter to fetch
+    only recent messages and avoid filling your context with old history.
+
+    Typical polling pattern:
+    1. Call get_room_status to check message_count
+    2. If count increased since last check, call get_history(limit=N) for new messages
 
     Args:
         room_id: The ID of the room to get history for
-        limit: Optional maximum number of messages to return (most recent).
-               If not specified, returns all messages.
+        limit: Maximum number of messages to return (most recent). Recommended
+               to use a limit to avoid context overflow.
 
     Returns:
-        {
-            "room_id": "...",
-            "messages": [
-                {
-                    "sender": "display_name",
-                    "content": "message text",
-                    "timestamp": "ISO timestamp",
-                    "message_id": "uuid",
-                    "is_system": false
-                }
-            ],
-            "total_count": 42
-        }
+        room_id, messages list, and total_count
     """
     messages = await history_manager.get_history(room_id, limit)
     total_count = await history_manager.get_message_count(room_id)
@@ -516,25 +322,23 @@ async def get_history(room_id: str, limit: int | None = None) -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_room_status(room_id: str) -> Dict[str, Any]:
-    """Get status and metadata for a room.
+    """Lightweight status check for a conversation thread.
 
-    Returns information about the room including active status, participants,
-    message count, and activity timestamps. Anyone with the room_id can
-    query status (room_id acts as shared secret).
+    Returns message_count - compare this to your last known count to detect
+    new messages without fetching full history. Use this to poll for new
+    messages before calling get_history.
+
+    Example polling flow:
+    1. After sending a message, note the message_count
+    2. Later, call get_room_status and compare message_count
+    3. If count increased, call get_history(limit=N) to fetch new messages
 
     Args:
-        room_id: The ID of the room to get status for
+        room_id: The ID of the room to check
 
     Returns:
-        {
-            "room_id": "...",
-            "exists": true,
-            "active": true,
-            "participants": ["Claude-1", "Claude-2"],
-            "message_count": 42,
-            "created_at": "ISO timestamp",
-            "last_activity": "ISO timestamp"
-        }
+        Room metadata including exists, active, participants, message_count,
+        created_at, and last_activity timestamps
     """
     # Check in-memory room first (for active status)
     room = await room_manager.get_room(room_id)
