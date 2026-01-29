@@ -417,11 +417,15 @@ async def handle_disconnect(connection_id: str) -> None:
     logger.info(f"User {user.name} disconnected")
 
 
+# Expose ASGI app for uvicorn
+app = mcp.http_app()
+
+
 def main() -> None:
     """Main entry point for the server."""
     import uvicorn
 
-    uvicorn.run("mcp_chat.server:mcp", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("mcp_chat.server:app", host="0.0.0.0", port=8000, reload=True)
 
 
 if __name__ == "__main__":
